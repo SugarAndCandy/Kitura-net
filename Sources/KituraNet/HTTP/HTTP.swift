@@ -92,7 +92,6 @@ public class HTTP {
     public static func createServer() -> HTTPServer {
         return HTTPServer()
     }
-    #if os(Linux) || os(macOS)
     /**
     Create a new `ClientRequest` using URL.
     
@@ -153,7 +152,6 @@ public class HTTP {
         req.end()
         return req
     }
-    #endif
     
     /// A set of characters that are valid in requests.
     private static let allowedCharacterSet =  NSCharacterSet(charactersIn:"\"#%/<>?@\\^`{|} ").inverted

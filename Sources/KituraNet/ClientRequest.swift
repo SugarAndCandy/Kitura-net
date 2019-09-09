@@ -16,11 +16,12 @@
 
 
 
-#if os(Linux) || os(macOS)
 import LoggerAPI
 import Socket
-import CCurl
 import Foundation
+#if os(Linux) || os(macOS)
+import CCurl
+#endif
 
 // The public API for ClientRequest erroneously defines the port as an Int16, which is
 // insufficient to hold all possible port values. To avoid a breaking change, we allow
@@ -35,6 +36,9 @@ fileprivate extension Int16 {
         return UInt16(bitPattern: self)
     }
 }
+
+#if os(Linux) || os(macOS)
+
 
 // MARK: ClientRequest
 /**
@@ -498,7 +502,7 @@ public class ClientRequest {
     public func end(close: Bool = false) {
 
         closeConnection = close
-
+        print("port: ", self.url)
         guard  let urlBuffer = url.cString(using: .utf8) else {
             callback(nil)
             return
@@ -807,4 +811,486 @@ private struct OneTimeInitializations {
     }
 }
 
+#endif
+
+#if os(iOS)
+
+public class ClientRequest {
+    
+    /**
+     The set of HTTP headers to be sent with the request.
+     
+     ### Usage Example: ###
+     ````swift
+     clientRequest.headers["Content-Type"] = ["text/plain"]
+     ````
+     */
+    public var headers = [String: String]()
+    
+    /**
+     The URL for the request.
+     
+     ### Usage Example: ###
+     ````swift
+     clientRequest.url = "https://localhost:8080"
+     ````
+     */
+    public private(set) var url: String = ""
+    
+    /**
+     The HTTP method (i.e. GET, POST, PUT, DELETE) for the request.
+     
+     ### Usage Example: ###
+     ````swift
+     clientRequest.method = "post"
+     ````
+     */
+    public private(set) var method: String = "get"
+    
+    /**
+     The username to be used if using Basic Auth authentication.
+     
+     ### Usage Example: ###
+     ````swift
+     clientRequest.userName = "user1"
+     ````
+     */
+    public private(set) var userName: String?
+    
+    /**
+     The password to be used if using Basic Auth authentication.
+     
+     ### Usage Example: ###
+     ````swift
+     clientRequest.password = "sUpeR_seCurE_paSsw0rd"
+     ````
+     */
+    public private(set) var password: String?
+    
+    /**
+     The maximum number of redirects before failure.
+     
+     - Note: The `ClientRequest` class will automatically follow redirect responses. To avoid redirect loops, it will at maximum follow `maxRedirects` redirects.
+     
+     ### Usage Example: ###
+     ````swift
+     clientRequest.maxRedirects = 10
+     ````
+     */
+    public private(set) var maxRedirects = 10
+    
+    /**
+     If true, the "Connection: close" header will be added to the request that is sent.
+     
+     ### Usage Example: ###
+     ````swift
+     ClientRequest.closeConnection = false
+     ````
+     */
+    public private(set) var closeConnection = false
+    
+    /**
+     Client request options enum. This allows the client to specify certain parameteres such as HTTP headers, HTTP methods, host names, and SSL credentials.
+     
+     ### Usage Example: ###
+     ````swift
+     //If present in the options provided, the client will try to use HTTP/2 protocol for the connection.
+     Options.useHTTP2
+     ````
+     */
+    
+    /// The callback to receive the response
+    private var callback: Callback
+
+    /// BufferList to store bytes to be written
+    fileprivate var writeBuffers = BufferList()
+
+    /// The Unix domain socket path used for the request
+    private var unixDomainSocketPath: String? = nil
+
+    /// Should SSL verification be disabled
+    private var disableSSLVerification = false
+    
+    /// Should HTTP/2 protocol be used
+    private var useHTTP2 = false
+
+    /// Response instance for communicating with client
+    fileprivate var response: ClientResponse?
+
+    /// Initializes a `ClientRequest` instance
+    ///
+    /// - Parameter url: url for the request
+    /// - Parameter callback: The closure of type `Callback` to be used for the callback.
+    init(url: String, callback: @escaping Callback) {
+        
+        self.url = url
+        self.callback = callback
+        
+    }
+    
+    /// Initializes a `ClientRequest` instance
+    ///
+    /// - Parameter options: An array of `Options' describing the request.
+    /// - Parameter unixDomainSocketPath: Specifies the path of a Unix domain socket that the client should connect to.
+    /// - Parameter callback: The closure of type `Callback` to be used for the callback.
+    init(options: [Options], unixDomainSocketPath: String? = nil, callback: @escaping Callback) {
+        
+        self.unixDomainSocketPath = unixDomainSocketPath
+        self.callback = callback
+        
+        var theSchema = "http://"
+        var hostName = "localhost"
+        var path = ""
+        var port = ""
+        
+        for option in options  {
+            switch(option) {
+                
+            case .method, .headers, .maxRedirects, .disableSSLVerification, .useHTTP2:
+                // call set() for Options that do not construct the URL
+                set(option)
+            case .schema(var schema):
+                if !schema.contains("://") && !schema.isEmpty {
+                    schema += "://"
+                }
+                theSchema = schema
+            case .hostname(let host):
+                hostName = host
+            case .port(let thePort):
+                let portNumber = thePort.toUInt16()
+                port = ":\(portNumber)"
+            case .path(var thePath):
+                if thePath.first != "/" {
+                    thePath = "/" + thePath
+                }
+                path = thePath
+            case .username(let userName):
+                self.userName = userName
+            case .password(let password):
+                self.password = password
+            }
+        }
+        
+        // Adding support for Basic HTTP authentication
+        let user = self.userName ?? ""
+        let pwd = self.password ?? ""
+        var authenticationClause = ""
+        // If either the userName or password are non-empty, add the authenticationClause
+        if (!user.isEmpty || !pwd.isEmpty) {
+            authenticationClause = "\(user):\(pwd)@"
+        }
+        
+        url = "\(theSchema)\(authenticationClause)\(hostName)\(port)\(path)"
+        
+    }
+    
+    public enum Options {
+        
+        /// Specifies the HTTP method (i.e. PUT, POST...) to be sent in the request
+        case method(String)
+        
+        /// Specifies the schema (i.e. HTTP, HTTPS) to be used in the URL of request
+        case schema(String)
+        
+        /// Specifies the host name to be used in the URL of request
+        case hostname(String)
+        
+        /// Specifies the port to be used in the URL of request.
+        ///
+        /// Note that an Int16 is incapable of representing all possible port values, however
+        /// it forms part of the Kitura-net 2.0 API. In order to pass a port number greater
+        /// than 32,767 (Int16.max), use the following code:
+        /// ```
+        /// let portNumber: UInt16 = 65535
+        /// let portOption: ClientRequest.Options = .port(Int16(bitPattern: portNumber))
+        /// ```
+        case port(Int16)
+        
+        /// Specifies the path to be used in the URL of request
+        case path(String)
+        
+        /// Specifies the HTTP headers to be sent with the request
+        case headers([String : String])
+        
+        /// Specifies the user name to be sent with the request, when using basic auth authentication
+        case username(String)
+        
+        /// Specifies the password to be sent with the request, when using basic auth authentication
+        case password(String)
+        
+        /// Specifies the maximum number of redirect responses that will be followed (i.e. re-issue the
+        /// request to the location received in the redirect response)
+        case maxRedirects(Int)
+        
+        /// If present, the SSL credentials of the remote server will not be verified.
+        ///
+        /// - Note: This is very useful when working with self signed certificates.
+        case disableSSLVerification
+        
+        /// If present, the client will try to use HTTP/2 protocol for the connection.
+        case useHTTP2
+    }
+    
+    /**
+     Response callback closure type.
+     
+     ### Usage Example: ###
+     ````swift
+     var ClientRequest.headers["Content-Type"] = ["text/plain"]
+     ````
+     
+     - Parameter ClientResponse: The `ClientResponse` object that describes the response that was received from the remote server.
+     
+     */
+    public typealias Callback = (KituraNet.ClientResponse?) -> Void
+    
+    /**
+     Set a single option in the request. URL parameters must be set in init().
+     
+     ### Usage Example: ###
+     ````swift
+     var options: [ClientRequest.Options] = []
+     options.append(.port(Int16(port)))
+     clientRequest.set(options)
+     ````
+     
+     - Parameter option: An `Options` instance describing the change to be made to the request.
+     
+     */
+    public func set(_ option: Options) {
+        
+        switch(option) {
+        case .schema, .hostname, .port, .path, .username, .password:
+            Log.error("Must use ClientRequest.init() to set URL components")
+        case .method(let method):
+            self.method = method
+        case .headers(let headers):
+            for (key, value) in headers {
+                self.headers[key] = value
+            }
+        case .maxRedirects(let maxRedirects):
+            self.maxRedirects = maxRedirects
+        case .disableSSLVerification:
+            self.disableSSLVerification = true
+        case .useHTTP2:
+            self.useHTTP2 = true
+        }
+    }
+    
+    /**
+     Parse an URL (String) into an array of ClientRequest.Options.
+     
+     ### Usage Example: ###
+     ````swift
+     let url: String = "http://www.website.com"
+     let parsedOptions = clientRequest.parse(url)
+     ````
+     
+     - Parameter urlString: A String object referencing a URL.
+     - Returns: An array of `ClientRequest.Options`
+     */
+    public class func parse(_ urlString: String) -> [KituraNet.ClientRequest.Options] {
+        if let url = URL(string: urlString) {
+            return parse(url)
+        }
+        return []
+        
+    }
+    
+    /**
+     Parse an URL Foudation object into an array of ClientRequest.Options.
+     
+     ### Usage Example: ###
+     ````swift
+     let url: URL = URL(string: "http://www.website.com")!
+     let parsedOptions = clientRequest.parse(url)
+     ````
+     
+     - Parameter url: Foundation URL object.
+     - Returns: An array of `ClientRequest.Options`
+     */
+    public class func parse(_ url: URL) -> [ClientRequest.Options] {
+        
+        var options: [ClientRequest.Options] = []
+        
+        if let scheme = url.scheme {
+            options.append(.schema("\(scheme)://"))
+        }
+        if let host = url.host {
+            options.append(.hostname(host))
+        }
+        var fullPath = url.path
+        // query strings and parameters need to be appended here
+        if let query = url.query {
+            fullPath += "?"
+            fullPath += query
+        }
+        options.append(.path(fullPath))
+        if let port = url.port {
+            options.append(.port(Int16(bitPattern: UInt16(port))))
+        }
+        if let username = url.user {
+            options.append(.username(username))
+        }
+        if let password = url.password {
+            options.append(.password(password))
+        }
+        return options
+    }
+    
+    /**
+     Add a String to the body of the request to be sent.
+     
+     ### Usage Example: ###
+     ````swift
+     let stringToSend: String = "send something"
+     clientRequest.write(from: stringToSend)
+     ````
+     
+     - Parameter from: The String to be added to the request.
+     */
+    public func write(from string: String) {
+        if  let data = string.data(using: .utf8)  {
+            write(from: data)
+        }
+    }
+    
+    /**
+     Add the bytes in a Data struct to the body of the request to be sent.
+     
+     ### Usage Example: ###
+     ````swift
+     let string = "some some more stuff"
+     if let data: Data = string.data(using: .utf8) {
+     clientRequest.write(from: data)
+     }
+     
+     ````
+     
+     - Parameter from: The Data Struct containing the bytes to be added to the request.
+     */
+    public func write(from data: Data) {
+        writeBuffers.append(data: data)
+
+    }
+    
+    /**
+     Add a String to the body of the request to be sent and then send the request to the remote server.
+     
+     ### Usage Example: ###
+     ````swift
+     let data: String = "send something"
+     clientRequest.end(from: data, close: true)
+     ````
+     
+     - Parameter data: The String to be added to the request.
+     - Parameter close: If true, add the "Connection: close" header to the set of headers sent with the request.
+     */
+    public func end(_ data: String, close: Bool = false) {
+        write(from: data)
+        end(close: close)
+
+    }
+    
+    /**
+     Add the bytes in a Data struct to the body of the request to be sent and then send the request to the remote server.
+     
+     ### Usage Example: ###
+     ````swift
+     let stringToSend = "send this"
+     let data: Data = stringToSend.data(using: .utf8) {
+     clientRequest.end(from: data, close: true)
+     }
+     ````
+     
+     - Parameter data: The Data struct containing the bytes to be added to the request.
+     - Parameter close: If true, add the "Connection: close" header to the set of headers sent with the request.
+     */
+    public func end(_ data: Data, close: Bool = false) {
+        write(from: data)
+        end(close: close)
+
+    }
+    
+    /**
+     Send the request to the remote server.
+     
+     ### Usage Example: ###
+     ````swift
+     clientRequest.end(true)
+     ````
+     
+     - Parameter close: If true, add the "Connection: close" header to the set of headers sent with the request.
+     */
+    public func end(close: Bool = false) {
+        
+        closeConnection = close
+        
+//        guard  let urlBuffer = url.cString(using: .utf8) else {
+//            callback(nil)
+//            return
+//        }
+        
+        guard let url = URL(string: self.url) else {
+            callback(nil)
+            return
+        }
+        let skipBody = (method.uppercased() == "HEAD")
+        response = ClientResponse(skipBody: skipBody)
+
+        var request = URLRequest(url: url)
+        let session = URLSession.shared
+        session.dataTask(with: request, completionHandler: { [weak self] (data, response, error) in
+
+            if let httpURLResponse = response as? HTTPURLResponse {
+//                self?.response?.
+//                clientResponse.httpStatusCode = HTTPStatusCode(rawValue: httpURLResponse.statusCode)
+            }
+            self?.callback(self?.response)
+
+        })
+        
+//        prepareHandle(using: urlBuffer)
+//
+//        let invoker = CurlInvoker(handle: handle!, maxRedirects: maxRedirects)
+//        invoker.delegate = self
+//        let skipBody = (method.uppercased() == "HEAD")
+//        response = ClientResponse(skipBody: skipBody)
+//
+//        var code = invoker.invoke()
+//        guard code == CURLE_OK else {
+//            Log.error("ClientRequest Error, Failed to invoke HTTP request. CURL Return code=\(code)")
+//            callback(nil)
+//            return
+//        }
+//
+//        code = curlHelperGetInfoLong(handle!, CURLINFO_RESPONSE_CODE, &response!.status)
+//        guard code == CURLE_OK else {
+//            Log.error("ClientRequest Error. Failed to get response code. CURL Return code=\(code)")
+//            callback(nil)
+//            return
+//        }
+//
+//        var httpStatusCode = response!.httpStatusCode
+//
+//        repeat {
+//            let parseStatus = response!.parse()
+//            guard parseStatus.error == nil else {
+//                Log.error("ClientRequest error. Failed to parse response. Error=\(parseStatus.error!)")
+//                callback(nil)
+//                return
+//            }
+//
+//            guard parseStatus.state == .messageComplete else {
+//                Log.error("ClientRequest error. Failed to parse response. Status=\(parseStatus.state)")
+//                callback(nil)
+//                return
+//            }
+//
+//            httpStatusCode = response!.httpStatusCode
+//        } while httpStatusCode == .continue || httpStatusCode == .switchingProtocols
+//
+//        self.callback(self.response)
+    }
+}
 #endif
